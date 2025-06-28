@@ -1,83 +1,172 @@
-// server.js (Node.js WebSocket Server for Imposter Word Game)
-
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 
-const wss = new WebSocket.Server({ port: 8080 });
+const wss = new WebSocket.Server({ port: 8080 }, () => {
+  console.log('✅ WebSocket server running on ws://localhost:8080');
+});
 
-const games = {}; // { roomCode: { players: [], word, imposterId, phase, turns, votes } }
-
-function broadcast(room, data) {
-  games[room].players.forEach(p => {
-    if (p.ws.readyState === WebSocket.OPEN) {
-      p.ws.send(JSON.stringify(data));
-    }
-  });
-}
+const rooms = {};
 
 wss.on('connection', (ws) => {
-  ws.on('message', (msg) => {
-    try {
-      const data = JSON.parse(msg);
-      if (data.type === 'join') {
-        const { name, room } = data;
-        if (!games[room]) {
-          games[room] = {
-            players: [],
-            word: '',
-            imposterId: null,
-            phase: 'lobby',
-            turns: [],
-            votes: {},
-          };
-        }
-        const player = { id: uuidv4(), name, ws, isImposter: false };
-        games[room].players.push(player);
-        ws.playerId = player.id;
-        ws.roomCode = room;
-        broadcast(room, { type: 'lobbyUpdate', players: games[room].players.map(p => p.name) });
+  ws.on('message', (message) => {
+    const msg = JSON.parse(message);
 
-      } else if (data.type === 'start') {
-        const room = ws.roomCode;
-        const game = games[room];
-        game.word = ['Apfel', 'Haus', 'Ball', 'Pferd'][Math.floor(Math.random() * 4)];
-        const imposter = game.players[Math.floor(Math.random() * game.players.length)];
-        game.imposterId = imposter.id;
-        game.phase = 'playing';
-        game.turns = [];
-        game.votes = {};
+    // Spieler betritt Raum
+    if (msg.type === 'join') {
+      const room = msg.room.toUpperCase();
+      if (!rooms[room]) {
+        rooms[room] = {
+          players: [],
+          gameStarted: false,
+          imposter: null,
+          word: '',
+          turnIndex: 0,
+          turns: [],
+          votes: {},
+          phase: 'lobby',
+          order: []
+        };
+      }
 
-        game.players.forEach(p => {
-          const payload = {
-            type: 'gameStart',
-            word: p.id === game.imposterId ? '???' : game.word,
-            yourId: p.id,
-            order: game.players.map(pl => pl.id),
-          };
-          p.ws.send(JSON.stringify(payload));
+      const player = {
+        id: uuidv4(),
+        name: msg.name,
+        ws: ws,
+        word: '',
+        isImposter: false
+      };
+
+      rooms[room].players.push(player);
+      ws.playerId = player.id;
+      ws.room = room;
+
+      sendLobbyUpdate(room);
+    }
+
+    // Spiel starten
+    if (msg.type === 'start') {
+      const room = rooms[ws.room];
+      if (!room || room.gameStarted) return;
+
+      room.gameStarted = true;
+      room.word = getRandomWord();
+      room.phase = 'turns';
+      room.turnIndex = 0;
+      room.turns = [];
+      room.votes = {};
+      room.order = shuffleArray(room.players.map(p => p.id));
+
+      const imposterId = room.order[Math.floor(Math.random() * room.order.length)];
+      room.imposter = imposterId;
+
+      for (const p of room.players) {
+        p.isImposter = p.id === imposterId;
+        const word = p.isImposter ? '???' : room.word;
+        p.ws.send(JSON.stringify({
+          type: 'gameStart',
+          word: word,
+          yourId: p.id,
+          order: room.order.map(id => getPlayerName(room, id)),
+          currentTurn: getPlayerName(room, room.order[0])
+        }));
+      }
+    }
+
+    // Spieler gibt ein Wort ab
+    if (msg.type === 'submitWord') {
+      const room = rooms[ws.room];
+      const player = getPlayerById(room, msg.playerId);
+      if (!room || !player || room.order[room.turnIndex] !== msg.playerId) return;
+
+      room.turns.push({ name: player.name, word: msg.word });
+      room.turnIndex++;
+
+      if (room.turnIndex >= room.order.length) {
+        // Runde vorbei
+        room.phase = 'decision';
+        broadcast(room, {
+          type: 'turnUpdate',
+          turns: room.turns,
+          allowVoting: true
+        });
+      } else {
+        // Nächster Spieler ist dran
+        broadcast(room, {
+          type: 'turnUpdate',
+          turns: room.turns,
+          currentTurn: getPlayerName(room, room.order[room.turnIndex])
+        });
+      }
+    }
+
+    // Spieler stimmt ab
+    if (msg.type === 'vote') {
+      const room = rooms[ws.room];
+      if (!room || !room.gameStarted || room.phase !== 'decision') return;
+      room.votes[msg.targetName] = (room.votes[msg.targetName] || 0) + 1;
+
+      const votesReceived = Object.keys(room.votes).length;
+      if (votesReceived >= room.players.length) {
+        const votedOut = Object.entries(room.votes).sort((a, b) => b[1] - a[1])[0][0];
+        const imposterName = getPlayerName(room, room.imposter);
+        const imposterCaught = votedOut === imposterName;
+
+        broadcast(room, {
+          type: 'gameOver',
+          imposter: imposterCaught,
+          realImposter: imposterName
         });
 
-      } else if (data.type === 'submitWord') {
-        const room = ws.roomCode;
-        const game = games[room];
-        game.turns.push({ playerId: data.playerId, word: data.word });
-        broadcast(room, { type: 'turnUpdate', turns: game.turns });
-
-      } else if (data.type === 'vote') {
-        const room = ws.roomCode;
-        const game = games[room];
-        game.votes[data.targetId] = (game.votes[data.targetId] || 0) + 1;
-        if (Object.keys(game.votes).length === game.players.length) {
-          const sorted = Object.entries(game.votes).sort((a, b) => b[1] - a[1]);
-          const [suspectId] = sorted[0];
-          const imposter = suspectId === game.imposterId;
-          broadcast(room, { type: 'gameOver', imposter, realImposter: game.players.find(p => p.id === game.imposterId).name });
-        }
+        room.phase = 'done';
       }
-    } catch (e) {
-      console.error('Invalid message', e);
+    }
+
+    // Spieler wählt "nächste Runde spielen"
+    if (msg.type === 'nextRound') {
+      const room = rooms[ws.room];
+      if (!room || room.phase !== 'decision') return;
+
+      room.phase = 'turns';
+      room.turnIndex = 0;
+      room.turns = [];
+      broadcast(room, {
+        type: 'turnUpdate',
+        turns: [],
+        currentTurn: getPlayerName(room, room.order[0])
+      });
     }
   });
 });
 
-console.log('WebSocket server running on ws://localhost:8080');
+// 📦 Hilfsfunktionen
+
+function sendLobbyUpdate(roomCode) {
+  const room = rooms[roomCode];
+  const names = room.players.map(p => p.name);
+  room.players.forEach(p => {
+    p.ws.send(JSON.stringify({ type: 'lobbyUpdate', players: names }));
+  });
+}
+
+function broadcast(room, message) {
+  const json = JSON.stringify(message);
+  room.players.forEach(p => p.ws.send(json));
+}
+
+function getPlayerById(room, id) {
+  return room.players.find(p => p.id === id);
+}
+
+function getPlayerName(room, id) {
+  const player = getPlayerById(room, id);
+  return player ? player.name : 'Unbekannt';
+}
+
+function getRandomWord() {
+  const words = ['Kaktus', 'Flugzeug', 'Banane', 'Buch', 'Spinne', 'Trompete', 'Schneemann'];
+  return words[Math.floor(Math.random() * words.length)];
+}
+
+function shuffleArray(array) {
+  return array.sort(() => Math.random() - 0.5);
+}
